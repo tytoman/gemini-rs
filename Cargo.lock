@@ -211,7 +211,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gemini-rs"
+name = "gemini_rs"
 version = "0.1.0"
 dependencies = [
  "reqwest",
