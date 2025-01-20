@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 trait GeminiAPI {
     fn get_api_key(&self) -> String;
@@ -25,9 +26,20 @@ pub struct Content {
     role: String,
 }
 
+#[derive(Error, Debug)]
+pub enum GeminiError {
+    #[error("API request failed: {0}")]
+    RequestError(#[from] reqwest::Error),
+    #[error("No response candidates available")]
+    NoCandidates,
+}
+
+const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/";
+const DEFAULT_MODEL: &str = "gemini-1.5-flash";
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Candicate {
+pub struct Candidate {
     content: Content,
     // finish_reason
     // safety_ratings
@@ -56,15 +68,28 @@ pub struct GenerateContentRequest {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateContentResponse {
-    candidates: Vec<Candicate>,
+    candidates: Vec<Candidate>,
     // prompt_feedback
     // usage_metadata
     model_version: String,
 }
 
 impl GenerateContentResponse {
-    pub fn get_text(&self) -> String {
-        self.candidates[0].content.parts[0].text.clone()
+    pub fn get_text(&self) -> Result<String, GeminiError> {
+        self.candidates
+            .first()
+            .and_then(|c| c.content.parts.first())
+            .map(|p| p.text.clone())
+            .ok_or(GeminiError::NoCandidates)
+    }
+}
+
+impl Content {
+    fn new(text: String, role: &str) -> Self {
+        Self {
+            parts: vec![Part { text }],
+            role: role.to_string(),
+        }
     }
 }
 
@@ -82,8 +107,8 @@ impl Conversation {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            base_url: "https://generativelanguage.googleapis.com/v1beta/".to_string(),
-            model: "gemini-1.5-flash".to_string(),
+            base_url: BASE_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
             history: Vec::new(),
             system_instruction: None,
             client: Client::new(),
@@ -91,18 +116,11 @@ impl Conversation {
     }
 
     pub fn set_system_instruction_text(&mut self, text: String) {
-        let system_instruction = Content {
-            parts: vec![Part { text }],
-            role: "system".to_string(),
-        };
-        self.system_instruction = Some(system_instruction);
+        self.system_instruction = Some(Content::new(text, "system"));
     }
 
-    pub async fn talk(&mut self, text: String) -> Result<GenerateContentResponse, reqwest::Error> {
-        self.history.push(Content {
-            parts: vec![Part { text }],
-            role: "user".to_string(),
-        });
+    pub async fn talk(&mut self, text: String) -> Result<GenerateContentResponse, GeminiError> {
+        self.history.push(Content::new(text, "user"));
 
         let request = GenerateContentRequest {
             model: self.model.clone(),
@@ -116,38 +134,32 @@ impl Conversation {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&request)
             .send()
+            .await?
+            .json::<GenerateContentResponse>()
             .await?;
 
-        let response = response.json::<GenerateContentResponse>().await?;
-        self.history.push(Content {
-            parts: vec![Part {
-                text: response.get_text(),
-            }],
-            role: "model".to_string(),
-        });
+        let response_text = response.get_text()?;
+        self.history.push(Content::new(response_text, "model"));
         Ok(response)
     }
 
-    pub async fn summarize(&mut self) -> Result<(), reqwest::Error> {
-        let mut conversation = Conversation::new(self.api_key.clone());
+    pub async fn summarize(&mut self) -> Result<(), GeminiError> {
+        let mut conversation = Self::new(self.api_key.clone());
         conversation.history = self.history.clone();
 
-        let text = "
-        Previous conversations need to be compressed to save the tokens needed to process the generative AI.
-        You are the AI assistant that summarises the conversation for this purpose."
-        .to_string();
-        conversation.set_system_instruction_text(text);
+        let system_instruction = "
+            Previous conversations need to be compressed to save the tokens needed to process the generative AI.
+            You are the AI assistant that summarises the conversation for this purpose."
+            .to_string();
+        conversation.set_system_instruction_text(system_instruction);
 
         let summary = conversation
             .talk("Summarize the conversation".to_string())
             .await?
-            .get_text();
+            .get_text()?;
 
         self.history.clear();
-        self.history.push(Content {
-            parts: vec![Part { text: summary }],
-            role: "model".to_string(),
-        });
+        self.history.push(Content::new(summary, "model"));
 
         Ok(())
     }
